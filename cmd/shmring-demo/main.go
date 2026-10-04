@@ -2,11 +2,12 @@
 //
 // 用法（在不同终端/进程中执行）：
 //
-//	shmring-demo create <name> [capacity]   创建缓冲区
-//	shmring-demo write  <name> <message>   写入一条完整记录
-//	shmring-demo read   <name>             读取并确认一条记录
-//	shmring-demo peek   <name>             查看但不确认（重复查看可识别重复）
-//	shmring-demo state  <name>             打印读写位置与序列号
+//	shmring-demo create  <name> [capacity]  创建缓冲区
+//	shmring-demo write   <name> <message>  写入一条完整记录
+//	shmring-demo read    <name>            读取并确认一条记录（旧式单消费者）
+//	shmring-demo consume <name>            以独立消费者身份领取一条（多消费者）
+//	shmring-demo peek    <name>            查看但不确认（重复查看可识别重复）
+//	shmring-demo state   <name>            打印读写位置、序列号与撕裂区
 //
 // 全部状态保存在系统临时目录的 shmring-<name>.dat 文件中，
 // 不依赖任何外部服务。
@@ -56,6 +57,22 @@ func main() {
 		fmt.Printf("wrote seq=%d bytes=%d reserved=%d write=%d read=%d\n",
 			seq, len(os.Args[3]), rsv, wp, rp)
 
+	case "consume":
+		r, err := shmring.Open(name, nil)
+		must(err)
+		defer r.Close()
+		c, err := r.Consumer()
+		must(err)
+		defer c.Close()
+		rec, err := c.Read()
+		if errors.Is(err, shmring.ErrEmpty) {
+			fmt.Printf("empty: 没有可领取的记录 claimPos=%d\n", r.ClaimPos())
+			return
+		}
+		must(err)
+		fmt.Printf("consumed seq=%d slot=%d payload=%q ack=%d\n",
+			rec.Seq, c.Slot(), rec.Payload, c.AckPos())
+
 	case "read", "peek":
 		r, err := shmring.Open(name, nil)
 		must(err)
@@ -81,8 +98,9 @@ func main() {
 		must(err)
 		defer r.Close()
 		rsv, wp, rp := r.Positions()
-		fmt.Printf("name=%s capacity=%d reserved=%d write=%d read=%d used=%d nextSeq=%d\n",
-			name, r.Capacity(), rsv, wp, rp, rsv-rp, r.NextSeq())
+		fmt.Printf("name=%s capacity=%d reserved=%d write=%d reclaim=%d claim=%d used=%d nextSeq=%d tornCount=%d torn=%+v\n",
+			name, r.Capacity(), rsv, wp, rp, r.ClaimPos(), rsv-rp, r.NextSeq(),
+			r.TornCount(), r.TornRegions())
 
 	default:
 		usage()
@@ -90,7 +108,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: shmring-demo {create|write|read|peek|state} <name> [args]")
+	fmt.Fprintln(os.Stderr, "usage: shmring-demo {create|write|read|consume|peek|state} <name> [args]")
 	os.Exit(2)
 }
 

@@ -49,9 +49,13 @@ type Ring struct {
 	ring     []byte // 数据区，长度 == capacity
 	capacity uint64
 
-	name string
-	dir  string
-	path string
+	name      string
+	dir       string
+	path      string
+	rlockPath string // 消费者槽位 OFD 锁文件
+
+	legacyMu sync.Mutex
+	legacy   *Consumer // 旧式单消费者 API 的隐式消费者（首次读取时注册）
 
 	closed atomic.Bool
 }
@@ -83,9 +87,9 @@ func validateCapacity(capacity int) error {
 	return nil
 }
 
-func (cfg Config) paths(dir string) (dat, mlock, clock, wlock string) {
+func (cfg Config) paths(dir string) (dat, mlock, clock, wlock, rlock string) {
 	base := filepath.Join(dir, "shmring-"+cfg.Name)
-	return base + ".dat", base + ".mlock", base + ".clock", base + ".wlock"
+	return base + ".dat", base + ".mlock", base + ".clock", base + ".wlock", base + ".rlock"
 }
 
 // flockNb 尝试非阻塞加锁，返回 (locked, err)。
@@ -148,7 +152,7 @@ func Create(cfg Config, opts *Options) (*Ring, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	datPath, mlockPath, clockPath, wlockPath := cfg.paths(dir)
+	datPath, mlockPath, clockPath, wlockPath, rlockPath := cfg.paths(dir)
 
 	mlock, err := acquireLiveLock(mlockPath)
 	if err != nil {
@@ -185,7 +189,7 @@ func Create(cfg Config, opts *Options) (*Ring, error) {
 	}
 
 	r := &Ring{file: f, mlock: mlock, name: cfg.Name, dir: dir, path: datPath,
-		capacity: uint64(cfg.Capacity)}
+		rlockPath: rlockPath, capacity: uint64(cfg.Capacity)}
 
 	if created {
 		if err := r.mapFile(); err != nil {
@@ -250,7 +254,7 @@ func Open(name string, opts *Options) (*Ring, error) {
 	dir := resolveDir(opts)
 	skipRecovery := opts != nil && opts.disableAutoRecover
 	cfg := Config{Name: name}
-	datPath, mlockPath, clockPath, wlockPath := cfg.paths(dir)
+	datPath, mlockPath, clockPath, wlockPath, rlockPath := cfg.paths(dir)
 
 	mlock, err := acquireLiveLock(mlockPath)
 	if err != nil {
@@ -272,7 +276,8 @@ func Open(name string, opts *Options) (*Ring, error) {
 		return nil, err
 	}
 
-	r := &Ring{file: f, mlock: mlock, name: name, dir: dir, path: datPath}
+	r := &Ring{file: f, mlock: mlock, name: name, dir: dir, path: datPath,
+		rlockPath: rlockPath}
 	if err := r.mapFile(); err != nil {
 		f.Close()
 		releaseWindow()
@@ -368,6 +373,10 @@ func (r *Ring) initHeader(capacity int) {
 	storeU64(r.header, offWritePos, 0)
 	storeU64(r.header, offReadPos, 0)
 	storeU64(r.header, offNextSeq, 1)
+	storeU64(r.header, offClaimPos, 0)
+	storeU64(r.header, offSlotBitmap, 0)
+	storeU64(r.header, offTornCount, 0)
+	// 槽位表与撕裂区表所在页由 truncate 保证为零填充，无需显式清零。
 	// initFlag 最后写入：挂载者只有看到 INIT 才认为头部初始化完成。
 	storeU32(r.header, offInitFlag, InitMagic)
 }
@@ -437,12 +446,43 @@ func (r *Ring) Positions() (reservedPos, writePos, readPos uint64) {
 // NextSeq 返回下一条记录将分配的序列号。
 func (r *Ring) NextSeq() uint64 { return loadU64(r.header, offNextSeq) }
 
+// ClaimPos 返回下一条待消费者领取的记录逻辑位置。
+func (r *Ring) ClaimPos() uint64 { return loadU64(r.header, offClaimPos) }
+
+// TornCount 返回历史上“写者写到一半崩溃”的分配次数（单调递增）。
+// 大于 0 即说明存在过未完成的写入；对应逻辑区间见 TornRegions。
+func (r *Ring) TornCount() uint64 { return loadU64(r.header, offTornCount) }
+
+// TornRegion 描述一段崩溃写者留下的、永不回收重用的逻辑区间。
+type TornRegion struct {
+	Start uint64 // 残片逻辑起点
+	End   uint64 // 残片逻辑末端（= 其后第一帧的起点）
+}
+
+// TornRegions 返回撕裂区表中当前保留的全部区间（最多最近 maxTornEntries 条）。
+func (r *Ring) TornRegions() []TornRegion {
+	var out []TornRegion
+	for j := 0; j < maxTornEntries; j++ {
+		start, end := tornEntry(r.header, j)
+		if end > start {
+			out = append(out, TornRegion{Start: start, End: end})
+		}
+	}
+	return out
+}
+
 // Close 解除挂载并释放本进程持有的锁；不删除映射文件，其它进程与后续
-// 挂载看到的数据不受影响。
+// 挂载看到的数据不受影响。若本 Ring 注册过隐式消费者，一并注销其槽位。
 func (r *Ring) Close() error {
 	if !r.closed.CompareAndSwap(false, true) {
 		return ErrClosed
 	}
+	r.legacyMu.Lock()
+	if r.legacy != nil {
+		_ = r.legacy.Close()
+		r.legacy = nil
+	}
+	r.legacyMu.Unlock()
 	var err error
 	if r.wlock != nil {
 		if e := r.wlock.Close(); e != nil {
@@ -470,7 +510,7 @@ func (r *Ring) Destroy() error {
 	if r.closed.Load() {
 		return ErrClosed
 	}
-	datPath, mlockPath, clockPath, wlockPath := Config{Name: r.name}.paths(r.dir)
+	datPath, mlockPath, clockPath, wlockPath, rlockPath := Config{Name: r.name}.paths(r.dir)
 
 	// 先释放本 Ring 自己的存活共享锁，再用全新描述符非阻塞探测：
 	// 若仍有任何存活挂载（含正处于挂载窗口者）持有共享锁，立即失败。
@@ -503,6 +543,7 @@ func (r *Ring) Destroy() error {
 	// 但新进程已无法再按名称挂载到它们。
 	rmErr := os.Remove(datPath)
 	_ = os.Remove(wlockPath)
+	_ = os.Remove(rlockPath)
 	_ = os.Remove(clockPath)
 	_ = os.Remove(mlockPath)
 

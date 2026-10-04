@@ -42,14 +42,33 @@ func (r *Ring) Write(payload []byte) (uint64, error) {
 	defer func() { _ = syscall.Flock(int(r.wlock.Fd()), syscall.LOCK_UN) }()
 
 	h := r.header
+
+	// 在线自愈：拿到写锁时若上一个写者留下了半条记录（reserved>write
+	// 只可能是死亡写者的残片），登记撕裂区并跳过，本写者照常继续写入。
+	// 不需要重新挂载、不需要人工清理；残片空间永不回收重用。
+	if torn := r.healLocked(); torn > 0 {
+		if err := r.flush(); err != nil {
+			return 0, err
+		}
+	}
+
 	reserved := loadU64(h, offReservedPos)
 	readPos := loadU64(h, offReadPos)
 	used := reserved - readPos // 注意：reserved >= readPos
 	total := frameTotal(len(payload))
 	if uint64(len(payload)) > r.capacity-frameOverhead ||
 		total > r.capacity-used {
-		// ErrFull 不消耗序列号：只有真正预留成功的写入才分配 seq。
-		return 0, ErrFull
+		// 写满时先回收死亡消费者的槽位、刷新回收边界再复核一次：
+		// 死亡消费者不得把写者永久卡在 ErrFull 上。
+		if r.refreshReclaimBoundary() {
+			reserved = loadU64(h, offReservedPos)
+			readPos = loadU64(h, offReadPos)
+			used = reserved - readPos
+		}
+		if total > r.capacity-used {
+			// ErrFull 不消耗序列号：只有真正预留成功的写入才分配 seq。
+			return 0, ErrFull
+		}
 	}
 
 	// 1) 单调分配序列号并持久化，使崩溃恢复后序列号不会回卷重用。

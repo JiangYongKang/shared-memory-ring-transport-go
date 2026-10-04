@@ -1,6 +1,7 @@
 package shmring
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -48,10 +49,15 @@ type Ring struct {
 	header   []byte
 	ring     []byte // 数据区，长度 == capacity
 	capacity uint64
+	hdrSize  int  // 本文件实际的头部大小（v1=128，v2=640）
+	legacyV1 bool // true 表示挂载的是版本 1 旧格式文件：仅限单消费者用法
 
 	name string
 	dir  string
 	path string
+
+	consMu sync.Mutex
+	cons   []*Consumer // 本进程内经由此 Ring 注册的存活消费者
 
 	closed atomic.Bool
 }
@@ -313,7 +319,7 @@ func (r *Ring) mapFile() error {
 		return err
 	}
 	size := int(fi.Size())
-	if size < headerSize {
+	if size < headerSizeV1 {
 		return fmt.Errorf("%w: file too short (%d bytes)", ErrMagicMismatch, size)
 	}
 	data, err := syscall.Mmap(int(r.file.Fd()), 0, size,
@@ -322,9 +328,22 @@ func (r *Ring) mapFile() error {
 		return err
 	}
 	r.data = data
-	r.header = data[:headerSize]
-	r.ring = data[headerSize:]
-	r.capacity = uint64(size - headerSize)
+	// 头部大小取决于格式版本：先按 v1 最小头读出版本与头大小字段，
+	// 再决定数据区起点。字段合法性由 validateHeader 最终把关。
+	hs := int(binary.LittleEndian.Uint32(data[offHeaderSize : offHeaderSize+4]))
+	switch hs {
+	case headerSizeV1, headerSize:
+		r.hdrSize = hs
+	default:
+		// 无法识别的头大小：先按当前版本切片，validateHeader 会拒绝。
+		r.hdrSize = headerSize
+	}
+	if size < r.hdrSize {
+		r.hdrSize = headerSizeV1
+	}
+	r.header = data[:r.hdrSize]
+	r.ring = data[r.hdrSize:]
+	r.capacity = uint64(size - r.hdrSize)
 	return nil
 }
 
@@ -368,6 +387,15 @@ func (r *Ring) initHeader(capacity int) {
 	storeU64(r.header, offWritePos, 0)
 	storeU64(r.header, offReadPos, 0)
 	storeU64(r.header, offNextSeq, 1)
+	// v2：消费模式未定，领取游标从 0 开始，所有消费者槽位空闲。
+	storeU32(r.header, offMode, modeUndecided)
+	storeU64(r.header, offClaimPos, 0)
+	for i := 0; i < MaxConsumers; i++ {
+		storeU64(r.header, slotOff(i, slotOffOwner), 0)
+		storeU64(r.header, slotOff(i, slotOffHeartbeat), 0)
+		storeU64(r.header, slotOff(i, slotOffPending), holdNone)
+		storeU64(r.header, slotOff(i, slotOffSeq), 0)
+	}
 	// initFlag 最后写入：挂载者只有看到 INIT 才认为头部初始化完成。
 	storeU32(r.header, offInitFlag, InitMagic)
 }
@@ -378,9 +406,12 @@ func conflict(kind ConflictKind, detail string) error {
 
 // validateHeader 只读取已映射头部并核对约定。expectedCapacity < 0 表示
 // Open 场景：以文件中记录的容量为准，但仍校验其合法性。
+//
+// 版本 1 的既有文件被接受并标记为 legacyV1：布局与行为和旧库完全一致，
+// 仅限单消费者用法；版本 2 文件支持全部能力。其它版本一律拒绝（只读）。
 func (r *Ring) validateHeader(expectedCapacity int) error {
 	h := r.header
-	if len(h) < headerSize {
+	if len(h) < headerSizeV1 {
 		return conflict(ConflictMagic, fmt.Sprintf("file shorter than header: %d bytes", len(h)))
 	}
 	// 初始化尚未完成（创建者在 initFlag 之前崩溃）。
@@ -390,11 +421,19 @@ func (r *Ring) validateHeader(expectedCapacity int) error {
 	if loadU32(h, offInitFlag) != InitMagic {
 		return conflict(ConflictMagic, "initialization marker missing; buffer creation did not complete")
 	}
-	if got := loadU32(h, offVersion); got != FormatVersion {
-		return conflict(ConflictVersion, fmt.Sprintf("file version=%d, library version=%d", got, FormatVersion))
-	}
-	if got := int(loadU32(h, offHeaderSize)); got != headerSize {
-		return conflict(ConflictParams, fmt.Sprintf("header size=%d, library expects %d", got, headerSize))
+	version := loadU32(h, offVersion)
+	switch version {
+	case formatVersionV1:
+		if got := int(loadU32(h, offHeaderSize)); got != headerSizeV1 {
+			return conflict(ConflictParams, fmt.Sprintf("v1 header size=%d, expect %d", got, headerSizeV1))
+		}
+		r.legacyV1 = true
+	case FormatVersion:
+		if got := int(loadU32(h, offHeaderSize)); got != headerSize {
+			return conflict(ConflictParams, fmt.Sprintf("header size=%d, library expects %d", got, headerSize))
+		}
+	default:
+		return conflict(ConflictVersion, fmt.Sprintf("file version=%d, library versions=%d/%d", version, formatVersionV1, FormatVersion))
 	}
 	cap := int(loadU64(h, offCapacity))
 	if cap != int(r.capacity) {
@@ -437,11 +476,21 @@ func (r *Ring) Positions() (reservedPos, writePos, readPos uint64) {
 // NextSeq 返回下一条记录将分配的序列号。
 func (r *Ring) NextSeq() uint64 { return loadU64(r.header, offNextSeq) }
 
+// ClaimPos 返回消费者组模式下共享领取游标的当前值（单消费者模式下无意义）。
+func (r *Ring) ClaimPos() uint64 { return loadU64(r.header, offClaimPos) }
+
 // Close 解除挂载并释放本进程持有的锁；不删除映射文件，其它进程与后续
-// 挂载看到的数据不受影响。
+// 挂载看到的数据不受影响。经由本 Ring 注册的消费者会被一并注销。
 func (r *Ring) Close() error {
 	if !r.closed.CompareAndSwap(false, true) {
 		return ErrClosed
+	}
+	r.consMu.Lock()
+	cons := r.cons
+	r.cons = nil
+	r.consMu.Unlock()
+	for _, c := range cons {
+		_ = c.Close()
 	}
 	var err error
 	if r.wlock != nil {

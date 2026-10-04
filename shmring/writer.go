@@ -18,12 +18,17 @@ var midPayloadHook func(seq uint64)
 // Write 以原子发布方式写入一条完整记录，返回该记录的序列号。
 //
 // 语义：
-//   - 剩余逻辑空间（capacity - (reservedPos-readPos)）不足以容纳
-//     帧头+负载+帧尾时返回 ErrFull，绝不覆盖未消费记录；
+//   - 剩余逻辑空间（capacity - (reservedPos-回收下限)）不足以容纳
+//     帧头+负载+帧尾时返回 ErrFull，绝不覆盖未消费记录。回收下限在
+//     单消费者模式下是 readPos，在消费者组模式下是“共享领取游标与
+//     各活跃消费者持有位置的最小值”，即最慢消费者也能拖住写者；
 //   - 负载超过 Capacity()-frameOverhead 时返回 ErrPayloadTooLarge；
 //   - 跨进程写者通过写锁串行化，同进程写者通过互斥锁串行化；
 //   - 序列号在预留前单调分配并持久化，因此崩溃造成的序列号空洞是可解释的，
-//     消费者可据此识别“曾经尝试但未提交”的写入。
+//     消费者可据此识别“曾经尝试但未提交”的写入；
+//   - v2 缓冲区上，若发现上一个写者崩溃留下的未提交分配
+//     （reservedPos > writePos），本写者先在写锁内把它改写为空洞帧
+//     （在线自愈，见 healGapLocked），再继续本次写入。
 func (r *Ring) Write(payload []byte) (uint64, error) {
 	if r.closed.Load() {
 		return 0, ErrClosed
@@ -42,9 +47,15 @@ func (r *Ring) Write(payload []byte) (uint64, error) {
 	defer func() { _ = syscall.Flock(int(r.wlock.Fd()), syscall.LOCK_UN) }()
 
 	h := r.header
+	if !r.legacyV1 {
+		// 在线自愈：崩溃写者的残留分配在此被固化为空洞帧。
+		if _, _, err := r.healGapLocked(); err != nil {
+			return 0, err
+		}
+	}
 	reserved := loadU64(h, offReservedPos)
-	readPos := loadU64(h, offReadPos)
-	used := reserved - readPos // 注意：reserved >= readPos
+	floor := r.reclaimFloor()
+	used := reserved - floor // 注意：reserved >= floor
 	total := frameTotal(len(payload))
 	if uint64(len(payload)) > r.capacity-frameOverhead ||
 		total > r.capacity-used {

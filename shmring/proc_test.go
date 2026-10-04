@@ -60,6 +60,13 @@ func TestChildProcess(t *testing.T) {
 	if scene == "" {
 		t.Skip("parent process")
 	}
+	// 可选：通过环境变量调整子进程的消费者心跳节奏。
+	if ms, err := strconv.Atoi(os.Getenv("SHMRING_TTL_MS")); err == nil && ms > 0 {
+		consumerTTL = time.Duration(ms) * time.Millisecond
+	}
+	if ms, err := strconv.Atoi(os.Getenv("SHMRING_HB_MS")); err == nil && ms > 0 {
+		heartbeatInterval = time.Duration(ms) * time.Millisecond
+	}
 	dir := os.Getenv("SHMRING_DIR")
 	name := os.Getenv("SHMRING_NAME")
 	cap, _ := strconv.Atoi(os.Getenv("SHMRING_CAP"))
@@ -72,6 +79,12 @@ func TestChildProcess(t *testing.T) {
 	case strings.HasPrefix(scene, "writer-stream-"):
 		id, _ := strconv.Atoi(strings.TrimPrefix(scene, "writer-stream-"))
 		childWriterStream(t, dir, name, id)
+	case scene == "writer-wait-go":
+		childWriterWaitGo(t, dir, name)
+	case scene == "consumer-claim":
+		childConsumerClaim(t, dir, name)
+	case scene == "consumer-hold-die":
+		childConsumerHoldDie(t, dir, name)
 	case scene == "reader-die":
 		childReaderDie(t, dir, name)
 	case scene == "mount-badcap":
@@ -592,29 +605,31 @@ func TestCrashNoOverwriteUnread(t *testing.T) {
 		t.Fatalf("unread record lost/altered: %+v, %v", rec, err)
 	}
 
-	// 自动回收的新挂载：残片空间只能在“逻辑尾”逻辑中被后续写入复用，
-	// 但已提交但未确认的 3 条记录（372 字节）绝不能被覆盖。
+	// 自动回收的新挂载：v2 语义下崩溃写者的那一次分配被固化为空洞帧，
+	// 空间永不回收重用；已提交但未确认的 3 条记录（372 字节）同样占位。
 	obs.Close()
-	recRing, err := Open(name, &Options{Dir: dir}) // 触发自动回收
+	recRing, err := Open(name, &Options{Dir: dir}) // 触发自动在线自愈
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer recRing.Close()
 	resv, wp, rp = recRing.Positions()
-	t.Logf("after recover: reserved=%d write=%d read=%d used=%d free=%d",
-		resv, wp, rp, wp-rp, cap-int(wp-rp))
+	t.Logf("after heal: reserved=%d write=%d read=%d used=%d free=%d",
+		resv, wp, rp, resv-rp, cap-int(resv-rp))
 	if resv != wp {
-		t.Fatalf("torn gap not reclaimed: reserved=%d write=%d", resv, wp)
+		t.Fatalf("heal must advance writePos to reservedPos: reserved=%d write=%d", resv, wp)
 	}
-	// 可用空间 = 512 - 372 = 140，不足以再放 124 的帧？140 >= 124，可以放 1 条。
-	if _, err := recRing.Write(big(9)); err != nil {
-		t.Logf("note: no room even for one frame right at boundary (%v)", err)
+	// 空洞帧可见：逻辑位置 496 处是 124 字节的 GAP（“这里曾经有一次没完成的写入”）。
+	gapLen, ok := recRing.committedGapAt(496, resv)
+	if !ok || gapLen != 124 {
+		t.Fatalf("gap frame at 496 = (%d, %v), want (124, true)", gapLen, ok)
 	}
-	// 再写第二条必须 ErrFull（不得覆盖未消费的 bulk-1..bulk-3）。
-	if _, err := recRing.Write(big(8)); !errors.Is(err, ErrFull) {
-		t.Fatalf("second write must be ErrFull, got %v", err)
+	t.Logf("torn allocation preserved as gap frame @496 len=124 (never reclaimed)")
+	// 空洞仍占位：used = 620-124 = 496，free = 16 < 124，写入必须 ErrFull。
+	if _, err := recRing.Write(big(9)); !errors.Is(err, ErrFull) {
+		t.Fatalf("write while gap+unread occupy space = %v, want ErrFull", err)
 	}
-	// 逐条确认剩余记录，内容与序号连续。
+	// 逐条确认剩余记录，内容与序号连续（未被覆盖、未被改写）。
 	for i := 1; i <= 3; i++ {
 		rec, err := recRing.Read()
 		if err != nil {
@@ -626,5 +641,423 @@ func TestCrashNoOverwriteUnread(t *testing.T) {
 		}
 	}
 	_, wp, rp = recRing.Positions()
-	t.Logf("all confirmed: write=%d read=%d used=%d", wp, rp, wp-rp)
+	t.Logf("all confirmed: write=%d read=%d used=%d (only the gap remains)", wp, rp, wp-rp)
+	// 确认后只剩空洞本身占位（124 字节）：写者恢复，且序列号不回卷
+	// （崩溃写者已消耗 seq=5）。
+	seq, err := recRing.Write(big(9))
+	if err != nil {
+		t.Fatalf("write after confirming unread records: %v", err)
+	}
+	if seq != 6 {
+		t.Fatalf("seq after torn write = %d, want 6 (seq=5 burned by crashed writer)", seq)
+	}
+	t.Logf("writer resumed after confirmations: seq=%d (seq=5 remains a visible hole)", seq)
+}
+
+// ---------------------------------------------------------------------------
+// 多消费者与在线自愈的跨进程场景
+// ---------------------------------------------------------------------------
+
+// waitForFile 等待一个标记文件出现（子进程间握手用）。
+func waitForFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("marker file %s never appeared", path)
+}
+
+// childConsumerClaim：注册一个消费者，持续领取记录并把 (seq, payload)
+// 追加到结果文件；看到停止文件且无记录可领时退出。
+func childConsumerClaim(t *testing.T, dir, name string) {
+	r, err := Open(name, &Options{Dir: dir})
+	if err != nil {
+		childFatalf(exitErrOther, "consumer child open: %v", err)
+	}
+	defer r.Close()
+	c, err := r.NewConsumer()
+	if err != nil {
+		childFatalf(exitErrOther, "consumer child NewConsumer: %v", err)
+	}
+	defer c.Close()
+	result := os.Getenv("SHMRING_RESULT")
+	stop := os.Getenv("SHMRING_STOP")
+	f, err := os.OpenFile(result, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		childFatalf(exitErrOther, "consumer child result file: %v", err)
+	}
+	defer f.Close()
+	for {
+		rec, err := c.Next()
+		if errors.Is(err, ErrEmpty) {
+			if _, e := os.Stat(stop); e == nil {
+				return
+			}
+			time.Sleep(3 * time.Millisecond)
+			continue
+		}
+		if err != nil {
+			childFatalf(exitErrOther, "consumer child next: %v", err)
+		}
+		fmt.Fprintf(f, "%d %s\n", rec.Seq, rec.Payload)
+		_ = f.Sync()
+		if err := c.Confirm(); err != nil {
+			childFatalf(exitErrOther, "consumer child confirm: %v", err)
+		}
+	}
+}
+
+// childWriterWaitGo：先挂载（留下 mounted 标记证明“已在运行”），
+// 等待 go 文件出现后写入 count 条记录再退出。
+func childWriterWaitGo(t *testing.T, dir, name string) {
+	r, err := Open(name, &Options{Dir: dir})
+	if err != nil {
+		childFatalf(exitErrOther, "wait-go writer open: %v", err)
+	}
+	defer r.Close()
+	mounted := os.Getenv("SHMRING_MOUNTED")
+	goFile := os.Getenv("SHMRING_GO")
+	count, _ := strconv.Atoi(os.Getenv("SHMRING_COUNT"))
+	if err := os.WriteFile(mounted, []byte("1"), 0o644); err != nil {
+		childFatalf(exitErrOther, "wait-go writer mark: %v", err)
+	}
+	for {
+		if _, err := os.Stat(goFile); err == nil {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	for i := 0; i < count; i++ {
+		p := []byte(fmt.Sprintf("B-record-%d-pad", i))
+		for {
+			_, err := r.Write(p)
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, ErrFull) {
+				childFatalf(exitErrOther, "wait-go writer write: %v", err)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	fmt.Printf("CHILD-WRITER-B: wrote %d records after crash of writer A\n", count)
+}
+
+// childConsumerHoldDie：领取一条记录后不确认、不注销，直接退出，
+// 模拟消费者进程崩溃（槽位随心跳过期被其他消费者接管）。
+func childConsumerHoldDie(t *testing.T, dir, name string) {
+	r, err := Open(name, &Options{Dir: dir})
+	if err != nil {
+		childFatalf(exitErrOther, "hold-die consumer open: %v", err)
+	}
+	defer r.Close()
+	c, err := r.NewConsumer()
+	if err != nil {
+		childFatalf(exitErrOther, "hold-die consumer NewConsumer: %v", err)
+	}
+	rec, err := c.Next()
+	if err != nil {
+		childFatalf(exitErrOther, "hold-die consumer next: %v", err)
+	}
+	fmt.Printf("CHILD-CONSUMER: claimed seq=%d payload=%q, dying without confirm\n",
+		rec.Seq, rec.Payload)
+	os.Exit(exitChildSignalCrash)
+}
+
+// TestMultiConsumerCrossProcess：2 个真实消费者子进程 + 父进程消费者
+// 并发领取 3 个写进程写入的 180 条记录，每条必须恰好被领取一次。
+func TestMultiConsumerCrossProcess(t *testing.T) {
+	dir := testDir(t)
+	name := "mcp"
+	r, err := Create(Config{Name: name, Capacity: 1 << 16}, &Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	pc, err := r.NewConsumer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+
+	stopFile := filepath.Join(dir, "stop")
+	resultFiles := []string{
+		filepath.Join(dir, "result-0.txt"),
+		filepath.Join(dir, "result-1.txt"),
+	}
+	// 子进程 TTL 调大：避免高负载下心跳抖动被误判为崩溃（本场景不测试崩溃）。
+	consumers := make([]*exec.Cmd, 2)
+	for i := range consumers {
+		consumers[i] = runChild(t, "consumer-claim",
+			"SHMRING_DIR="+dir, "SHMRING_NAME="+name,
+			"SHMRING_RESULT="+resultFiles[i], "SHMRING_STOP="+stopFile,
+			"SHMRING_TTL_MS=30000", "SHMRING_HB_MS=100")
+	}
+	const writers, perWriter = 3, 60
+	const total = writers * perWriter
+	wcmds := make([]*exec.Cmd, writers)
+	for i := 0; i < writers; i++ {
+		wcmds[i] = runChild(t, fmt.Sprintf("writer-stream-%d", i),
+			"SHMRING_DIR="+dir, "SHMRING_NAME="+name)
+	}
+
+	// union[seq] = payload：父进程自己的领取 + 两个子进程的结果文件。
+	union := make(map[uint64]string)
+	collect := func() {
+		for _, rf := range resultFiles {
+			data, err := os.ReadFile(rf)
+			if err != nil {
+				continue
+			}
+			for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+				if line == "" {
+					continue
+				}
+				var seq uint64
+				var payload string
+				if _, err := fmt.Sscanf(line, "%d %s", &seq, &payload); err != nil {
+					t.Fatalf("bad result line %q: %v", line, err)
+				}
+				if prev, dup := union[seq]; dup && prev != payload {
+					t.Fatalf("seq %d delivered twice with different payloads: %q vs %q",
+						seq, prev, payload)
+				}
+				union[seq] = payload
+			}
+		}
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for len(union) < total {
+		if time.Now().After(deadline) {
+			collect()
+			t.Fatalf("timeout: claimed %d/%d unique records", len(union), total)
+		}
+		rec, err := pc.Next()
+		if errors.Is(err, ErrEmpty) {
+			collect()
+			time.Sleep(3 * time.Millisecond)
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if prev, dup := union[rec.Seq]; dup && prev != string(rec.Payload) {
+			t.Fatalf("seq %d duplicate with different payload", rec.Seq)
+		}
+		union[rec.Seq] = string(rec.Payload)
+		if err := pc.Confirm(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 全部领取完毕：通知子进程退出并等待所有人结束。
+	if err := os.WriteFile(stopFile, []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i, c := range wcmds {
+		waitChild(t, c, fmt.Sprintf("writer-%d", i))
+	}
+	for i, c := range consumers {
+		waitChild(t, c, fmt.Sprintf("consumer-%d", i))
+	}
+	collect()
+
+	// 校验依据一：序列号恰好覆盖 1..total，无重复、无缺失。
+	if len(union) != total {
+		t.Fatalf("claimed %d unique records, want %d", len(union), total)
+	}
+	for seq := uint64(1); seq <= total; seq++ {
+		if _, ok := union[seq]; !ok {
+			t.Fatalf("seq %d missing", seq)
+		}
+	}
+	// 校验依据二：负载编码 (writer,msg) 对必须全局唯一且格式自洽。
+	pairs := make(map[string]bool)
+	for seq, p := range union {
+		var w, m, pad int
+		if n, _ := fmt.Sscanf(p, "p%d-m%d-pad-%024d", &w, &m, &pad); n != 3 || m != pad {
+			t.Fatalf("seq %d payload %q does not match writer format", seq, p)
+		}
+		key := fmt.Sprintf("%d-%d", w, m)
+		if pairs[key] {
+			t.Fatalf("payload pair %s delivered twice", key)
+		}
+		pairs[key] = true
+	}
+	t.Logf("cross-process exactly-once: %d records, %d unique (writer,msg) pairs, claimed by 3 consumers in 2 processes + parent",
+		len(union), len(pairs))
+	resv, wp, _ := r.Positions()
+	t.Logf("final: reserved=%d write=%d claim=%d floor=%d",
+		resv, wp, r.ClaimPos(), r.reclaimFloor())
+}
+
+// TestWriterCrashOnlineHeal：写者 A 写到一半被杀，已挂载的写者 B
+// 无需重挂载即可继续写入（首笔写触发在线自愈），父进程消费者
+// 无需重挂载即可读到崩溃之后的新记录；残留分配固化为空洞帧。
+func TestWriterCrashOnlineHeal(t *testing.T) {
+	dir := testDir(t)
+	name := "heal"
+	r, err := Create(Config{Name: name, Capacity: 2048}, &Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	// 父进程消费者在崩溃发生前就已挂载（消费者组模式）。
+	pc, err := r.NewConsumer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+
+	goFile := filepath.Join(dir, "go")
+	mountedFile := filepath.Join(dir, "mounted")
+	// 写者 B：先挂载并等待放行信号——验证“已经挂载、还在运行的写者”。
+	cmdB := runChild(t, "writer-wait-go",
+		"SHMRING_DIR="+dir, "SHMRING_NAME="+name,
+		"SHMRING_MOUNTED="+mountedFile, "SHMRING_GO="+goFile, "SHMRING_COUNT=5")
+	waitForFile(t, mountedFile, 10*time.Second)
+	t.Logf("writer B mounted and waiting; starting writer A (will crash mid-payload)")
+
+	// 写者 A：写 3 条完整记录后，第 4 条负载写一半时被杀。
+	cmdA := runChild(t, "writer-crash-midpayload",
+		"SHMRING_DIR="+dir, "SHMRING_NAME="+name, "SHMRING_CAP=2048")
+	err = cmdA.Wait()
+	ee, ok := err.(*exec.ExitError)
+	if !ok || ee.ExitCode() != exitChildSignalCrash {
+		t.Fatalf("writer A exit = %v, want crash code %d", err, exitChildSignalCrash)
+	}
+	t.Logf("writer A killed mid-payload; releasing writer B")
+
+	// 放行 B：它的第一笔写会在写锁内把 A 的残留固化为空洞帧。
+	if err := os.WriteFile(goFile, []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitChild(t, cmdB, "writer-B")
+
+	// 父进程消费者（未重挂载）依次读到 8 条：seq 1,2,3（A 的好记录）
+	// 与 seq 5..9（B 的记录）；seq=4 是崩溃写者烧掉的可见序列号空洞。
+	wantSeqs := []uint64{1, 2, 3, 5, 6, 7, 8, 9}
+	var got []uint64
+	deadline := time.Now().Add(15 * time.Second)
+	for len(got) < len(wantSeqs) {
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout: got seqs %v, want %v", got, wantSeqs)
+		}
+		rec, err := pc.Next()
+		if errors.Is(err, ErrEmpty) {
+			time.Sleep(3 * time.Millisecond)
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, rec.Seq)
+		want := wantSeqs[len(got)-1]
+		if rec.Seq != want {
+			t.Fatalf("record %d: seq=%d, want %d (seq=4 must be a visible hole)", len(got), rec.Seq, want)
+		}
+		var wantPayload string
+		if rec.Seq <= 3 {
+			wantPayload = fmt.Sprintf("good-%d-payload", rec.Seq)
+		} else {
+			wantPayload = fmt.Sprintf("B-record-%d-pad", rec.Seq-5)
+		}
+		if string(rec.Payload) != wantPayload {
+			t.Fatalf("seq=%d payload=%q, want %q", rec.Seq, rec.Payload, wantPayload)
+		}
+		if err := pc.Confirm(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Logf("consumer (no remount) read seqs %v: seq=4 is the burned hole from crashed writer A", got)
+
+	// 自愈后游标自洽，且残留分配以空洞帧形式可见、未被回收重用。
+	resv, wp, _ := r.Positions()
+	if resv != wp {
+		t.Fatalf("after heal reserved=%d != write=%d", resv, wp)
+	}
+	// 3 条好记录各占 38 字节 -> 空洞位于逻辑 114，长度 = 16+50+8 = 74。
+	gapLen, ok := r.committedGapAt(114, resv)
+	if !ok || gapLen != 74 {
+		t.Fatalf("gap frame at 114 = (%d, %v), want (74, true)", gapLen, ok)
+	}
+	t.Logf("torn allocation visible as gap frame @114 len=74; reserved=%d write=%d nextSeq=%d",
+		resv, wp, r.NextSeq())
+	if ns := r.NextSeq(); ns != 10 {
+		t.Fatalf("nextSeq = %d, want 10 (seq=4 burned, never reused)", ns)
+	}
+	// 恢复幂等：再次 Recover 不再有任何动作。
+	recovered, torn, err := r.Recover()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered || torn != 0 {
+		t.Fatalf("idempotent Recover = %v,%d, want false,0", recovered, torn)
+	}
+}
+
+// TestConsumerCrashRedeliveryProcess：消费者子进程领取记录后未确认即死，
+// 父进程消费者在心跳过期后按相同 Seq 接管重投。
+func TestConsumerCrashRedeliveryProcess(t *testing.T) {
+	// 父进程侧缩短 TTL；子进程用默认心跳（200ms），不会被误判。
+	oldT, oldI := consumerTTL, heartbeatInterval
+	consumerTTL = 600 * time.Millisecond
+	heartbeatInterval = 50 * time.Millisecond
+	defer func() { consumerTTL, heartbeatInterval = oldT, oldI }()
+
+	dir := testDir(t)
+	name := "crd"
+	r, err := Create(Config{Name: name, Capacity: 1024}, &Options{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err := r.Write([]byte("alpha")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Write([]byte("beta")); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := runChild(t, "consumer-hold-die", "SHMRING_DIR="+dir, "SHMRING_NAME="+name)
+	err = cmd.Wait()
+	ee, ok := err.(*exec.ExitError)
+	if !ok || ee.ExitCode() != exitChildSignalCrash {
+		t.Fatalf("consumer child exit = %v, want crash code %d", err, exitChildSignalCrash)
+	}
+	t.Logf("consumer child died holding seq=1 (unconfirmed)")
+
+	pc, err := r.NewConsumer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	// 崩溃尚未过期：先领到 seq=2（互不阻塞）。
+	rec, err := pc.Next()
+	if err != nil || rec.Seq != 2 || string(rec.Payload) != "beta" {
+		t.Fatalf("Next before TTL = %+v, %v, want seq=2 beta", rec, err)
+	}
+	if err := pc.Confirm(); err != nil {
+		t.Fatal(err)
+	}
+	// 心跳过期后：崩溃消费者的 seq=1 被接管重投，Seq 相同可识别。
+	time.Sleep(2 * consumerTTL)
+	stolen, err := pc.Next()
+	if err != nil {
+		t.Fatalf("steal after TTL: %v", err)
+	}
+	if stolen.Seq != 1 || string(stolen.Payload) != "alpha" {
+		t.Fatalf("stolen = %+v, want redelivery of seq=1 alpha", stolen)
+	}
+	t.Logf("crashed process's seq=1 redelivered to surviving consumer (same seq => recognizable)")
+	if err := pc.Confirm(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pc.Next(); !errors.Is(err, ErrEmpty) {
+		t.Fatalf("drained = %v, want ErrEmpty", err)
+	}
+	logGroupState(t, r, "after cross-process redelivery")
 }

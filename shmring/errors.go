@@ -1,14 +1,17 @@
 // Package shmring 实现基于本地内存映射文件的跨进程共享内存环形缓冲传输通道。
 //
 // 通道使用一个本地文件经 mmap 映射到各进程的地址空间，模拟共享内存。
-// 多个进程通过同一名称挂载同一缓冲区，以单写者（SPSC）的发布/确认协议
-// 传递完整记录：
+// 多个进程通过同一名称挂载同一缓冲区，以“预留/发布/确认”协议传递
+// 完整记录：
 //
-//   - 写者先预留（reserve）逻辑空间，再发布“带提交标记”的完整帧；
-//   - 读者只能读到带提交标记且 CRC 校验通过的帧，并通过序列号去重；
-//   - 写者崩溃残留的半条记录会在下一个挂载者拿到写锁后被识别并回收，
-//     读者永远不会消费未提交内容；
-//   - 读者崩溃只会重复投递未确认的记录，已确认数据不会再次出现。
+//   - 多写者：写者先预留（reserve）逻辑空间，再发布“带提交标记”的
+//     完整帧；跨进程写者由写锁串行化；
+//   - 多消费者：消费者组通过共享领取游标竞争领取，每条记录恰好被一个
+//     消费者领取一次，重复投递按序列号识别；也兼容单消费者游标用法；
+//   - 写者崩溃残留的半条记录由存活写者在线固化为空洞帧（空间不回收
+//     重用），消费者永远不会消费未提交内容，也无需重挂载；
+//   - 消费者崩溃只会使其未确认的记录被按相同序列号重投，
+//     已确认数据不会再次出现。
 package shmring
 
 import "errors"
@@ -69,6 +72,16 @@ var (
 	ErrClosed = errors.New("shmring: ring closed")
 	// ErrCorrupt 已提交区域内出现无法解释的结构损坏（正常崩溃恢复不会产生）。
 	ErrCorrupt = errors.New("shmring: corrupt committed region")
+	// ErrModeConflict 缓冲区已被固定为另一种消费模式：单消费者游标
+	// （Read/Peek/Advance）与消费者组（NewConsumer）不能混用。
+	ErrModeConflict = errors.New("shmring: buffer is pinned to the other consumption mode")
+	// ErrLegacyBuffer 缓冲区是版本 1 的旧格式文件：老的单消费者用法
+	// 完全可用，但消费者组等 v2 能力被明确拒绝。
+	ErrLegacyBuffer = errors.New("shmring: v1 format buffer does not support consumer groups")
+	// ErrTooManyConsumers 消费者槽位已满（MaxConsumers）。
+	ErrTooManyConsumers = errors.New("shmring: too many consumers")
+	// ErrNoHold 当前消费者没有持有待确认的记录。
+	ErrNoHold = errors.New("shmring: no held record to confirm")
 )
 
 func (e *ConflictError) Is(target error) bool {

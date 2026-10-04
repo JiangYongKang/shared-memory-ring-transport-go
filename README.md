@@ -8,6 +8,21 @@
 - 平台：Linux（其它平台可编译，`msync` 为空操作，测试目标平台为 Linux）
 - Go：1.25+
 
+核心能力：
+
+- **多写者**：跨进程/跨 goroutine 写者由写锁串行化，单条记录原子发布；
+- **多消费者（消费者组）**：多个进程/协程可同时挂载为消费者并发领取，
+  每条记录恰好被一个消费者领取一次；消费者崩溃后其在途记录按相同
+  序列号被其他消费者重投；
+- **写者崩溃在线自愈**：写者写到一半被杀，其他已挂载写者照常写入、
+  消费者照常读取，无需重挂载、无需人工清理；未完成的分配固化为
+  **空洞帧**，空间永不回收重用，现场可见；
+- **慢消费者背压**：写者回绕复用以“最慢消费者”为界，空间不足返回
+  明确的 `ErrFull`，绝不覆盖未确认记录；
+- **兼容**：v1 旧格式文件继续按老的单消费者语义工作；不兼容的用法
+  （混用消费模式、旧文件上用消费者组、未知版本）被明确拒绝，且拒绝
+  过程只读、不破坏正在使用缓冲区的进程。
+
 ---
 
 ## 1. 共享缓冲区的参数与版本约定
@@ -22,25 +37,28 @@
 | `shmring-<name>.mlock` | 存活挂载锁：挂载期间持有共享锁，`Destroy` 借它探测存活挂载 |
 | `shmring-<name>.wlock` | 写者锁：写入/恢复时短暂排他，跨进程串行化写者 |
 
-另有一个短暂持有的挂载窗口锁 `shmring-<name>.clock`，仅在创建/校验期间排他，
-不长期持有，因此同一进程内重复挂载不会与存活挂载的共享锁自死锁。
+另有一个短暂持有的挂载窗口锁 `shmring-<name>.clock`，仅在创建/校验期间排他。
 
-文件头固定 **128 字节**，所有多字节整数使用**小端编码**（跨 32/64 位与
-不同操作系统的 Go 进程布局一致），64 位字段均 8 字节对齐：
+### 1.2 文件头（v2，640 字节）
+
+所有多字节整数使用**小端编码**，64 位字段均 8 字节对齐：
 
 | 偏移 | 字段 | 含义 |
 | --- | --- | --- |
 | 0 | magic `SHRM` | 格式识别 |
-| 4 | version | 格式版本，当前为 `1` |
-| 8 | headerSize | 头大小，固定 128 |
+| 4 | version | 格式版本：当前库创建为 `2`，可挂载 `1` |
+| 8 | headerSize | 头大小：v1=128，v2=640 |
 | 16 | capacity | 数据区容量（字节，不含头） |
 | 24 | reservedPos | 已预留（可能含半条记录）的逻辑末端 |
 | 32 | writePos | 已**完整提交**、可供消费的逻辑末端 |
-| 40 | readPos | 已被读者**确认**的逻辑末端 |
+| 40 | readPos | 单消费者游标：已被确认的逻辑末端 |
 | 48 | nextSeq | 下一条记录的单调序列号（从 1 开始，永不重用） |
 | 56 | initFlag `INIT` | 头部初始化完成标记，最后写入 |
+| 64 | mode | 消费模式：0 未定 / 1 单消费者 / 2 消费者组（首次使用固定） |
+| 72 | claimPos | 消费者组共享领取游标 |
+| 128.. | 消费者槽位 ×16 | 每槽 32 字节：owner、心跳、持有位置、持有序列号 |
 
-### 1.2 记录帧格式
+### 1.3 记录帧与空洞帧
 
 每条记录是一帧，`总长度 = 16 + payload + 8`：
 
@@ -51,122 +69,135 @@
         16 字节帧头                    变长                 8 字节帧尾
 ```
 
-- `frameMagic = SHRF` 标记帧起始；
 - `crc32 = IEEE CRC32(seq 的小端 8 字节 || payload)`——**序列号纳入校验**，
   使“同长度旧帧残片”无法伪造新帧的提交；
 - 帧尾最后的 `CMIT` 提交标记在整帧字节写完并 `msync(MS_SYNC)` 之后才写入。
 
-### 1.3 创建与挂载约定（冲突必被拒绝，且原因可区分）
+**空洞帧**（v2）：写者崩溃留下的未提交分配被在线自愈改写为
+`GapMagic(SHRG)` 头的空洞帧，长度恰好等于那次未完成的分配。
+空洞帧不是数据，读者/消费者透明跳过；它占用的逻辑空间**永不回收重用**，
+是“这里曾经有一次没完成的写入”的永久可见证据。
 
-所有挂载者必须与创建时约定一致，否则返回 `*ConflictError`，可用
-`errors.Is` 区分四种原因。**校验是只读的：不写一字节，失败立即解除挂载，
-正在使用该缓冲区的其它进程不受任何影响。**
+### 1.4 创建、挂载与版本兼容
 
-| 哨兵错误 | ConflictKind | 触发条件 |
-| --- | --- | --- |
-| `ErrMagicMismatch` | magic mismatch | 魔数不是 `SHRM` 或缺少 `INIT` 标记 |
-| `ErrVersionMismatch` | version mismatch | 版本字段 ≠ 库版本 `1` |
-| `ErrCapacityMismatch` | capacity mismatch | `Create` 传入容量 ≠ 既有容量 |
-| `ErrParamMismatch` | parameter mismatch | 头部大小等其它帧约定不一致 |
+所有挂载者必须与既有文件约定一致，否则返回 `*ConflictError`（可用
+`errors.Is` 区分四种原因）。**校验是只读的：不写一字节，失败立即解除
+挂载，正在使用该缓冲区的其它进程不受任何影响。**
 
-容量合法性：必须 `>= MinCapacity(64)` 且为 **8 的倍数**，否则
-`ErrCapacityInvalid`；名称只允许字母/数字/`_`/`-`/`.`，不得含路径分隔符，
-否则 `ErrNameInvalid`；挂载不存在的名称返回 `ErrNotFound`。
-单条负载上限为 `Capacity() - 24`（帧头+帧尾），超过返回
-`ErrPayloadTooLarge`。
+| 哨兵错误 | 触发条件 |
+| --- | --- |
+| `ErrMagicMismatch` | 魔数不是 `SHRM` 或缺少 `INIT` 标记 |
+| `ErrVersionMismatch` | 版本既不是 1 也不是 2 |
+| `ErrCapacityMismatch` | `Create` 传入容量 ≠ 既有容量 |
+| `ErrParamMismatch` | 头部大小等其它约定参数不一致 |
+
+版本兼容矩阵：
+
+| 既有文件 | 本库行为 |
+| --- | --- |
+| v1（128 字节头） | 正常挂载，**仅限单消费者用法**（Read/Peek/Advance/Write/Recover），行为与旧库完全一致；`NewConsumer` 返回 `ErrLegacyBuffer` |
+| v2（640 字节头） | 全部能力 |
+| 其它版本 | `ErrVersionMismatch`，只读拒绝 |
+
+容量合法性：必须 `>= MinCapacity(64)` 且为 **8 的倍数**；名称只允许
+字母/数字/`_`/`-`/`.`；单条负载上限为 `Capacity() - 24`。
 
 ---
 
 ## 2. 并发可见性与覆盖语义
 
-### 2.1 三个逻辑游标
+### 2.1 逻辑游标
 
-`reservedPos / writePos / readPos` 都是**单调递增的逻辑字节计数**（不是物理
-偏移；物理位置 = `pos % capacity`，帧允许跨过物理末尾）。
+`reservedPos / writePos / readPos / claimPos` 都是**单调递增的逻辑字节
+计数**（物理位置 = `pos % capacity`，帧允许跨过物理末尾）：
 
-正常稳态下 `readPos <= writePos <= reservedPos`：
+- `reservedPos`：写者预留到哪里（含发布中的一帧）；
+- `writePos`：写者发布到哪里（**消费者唯一的可见性边界**）；
+- `readPos`：单消费者模式下读者确认到哪里；
+- `claimPos`：消费者组模式下共享领取游标（下一条待领取记录的位置）。
 
-- `readPos`：读者确认到哪里；
-- `writePos`：写者发布到哪里（**读者唯一的可见性边界**）；
-- `reservedPos`：写者预留到哪里（通常等于 `writePos`，发布中的一帧除外）。
+### 2.2 写入协议与在线自愈
 
-### 2.2 写入是“预留 → 写字节 → 原子发布”
+1. 加跨进程写锁；
+2. **（v2）在线自愈**：若 `reservedPos > writePos`，说明上一个写者在
+   发布前崩溃——当前写者把 `[writePos, reservedPos)` 改写为空洞帧并
+   推进 `writePos = reservedPos`，然后继续本次写入。其他已挂载写者
+   与消费者**无需重挂载、无需人工清理**即可继续；
+3. 检查 `capacity - (reservedPos - 回收下限) >= 帧长`，不足返回
+   **`ErrFull`**，不预留、不分配序列号；
+4. 分配单调 `seq`、推进 `reservedPos` 并 `msync`；
+5. 写帧头、负载、帧尾 CRC，`msync` 后原子推进 `writePos`。
 
-1. 加跨进程写锁；检查 `capacity - (reservedPos - readPos) >= 帧长`，
-   不足立即返回 **`ErrFull`**，不预留、不分配序列号；
-2. 分配单调 `seq`、推进 `reservedPos` 并 `msync`；
-3. 写帧头、负载、帧尾 CRC，然后 `msync`；
-4. **最后**写入帧尾 `CMIT`，再原子推进 `writePos` 并 `msync`。
+**回收下限**（写者回绕复用的边界，绝不越过）：
 
-第 4 步的 64 位原子 store 是 release 操作：此前所有帧字节写入，对之后
-acquire 读到新 `writePos` 的读者都可见。因此：
+- 单消费者模式：`readPos`；
+- 消费者组模式：`min(claimPos, 各活跃消费者持有未确认记录的位置)`。
+  即**最慢的消费者**拖住下限——它落后到空间不够时写者得到明确的
+  `ErrFull`，而不是丢数据或覆盖未确认记录。心跳过期的槽位不参与下限
+  （其在途记录会被接管重投），因此崩溃的消费者最终不会卡住写者。
 
-- **读者只能读到 `readPos..writePos` 区间、且帧尾带 `CMIT` 且 CRC 通过的帧**；
-  写者正在发布的半条记录对读者表现为 `ErrEmpty`，绝不会被当作有效数据；
-- **写者绝不覆盖未消费的完整记录**：空间计算以 `readPos` 为界，只有读者
-  确认（`Read`/`Advance` 推进 `readPos`）后空间才允许回绕复用；
-- 写满返回 `ErrFull`，读空返回 `ErrEmpty`，两者都是明确可验证的稳定状态。
+### 2.3 两种互斥的消费模式
 
-### 2.3 重复读取可被识别
+同一个缓冲区的消费模式由**首次使用**固定，混用被明确拒绝
+（`ErrModeConflict`），拒绝不影响在用方：
 
-`Peek()` 只查看不确认；对同一位置连续 `Peek` 返回**相同序列号**的同一条
-记录。消费者据此把“确认前崩溃导致的再次投递”识别为重复，而不是新数据。
-`Read()` 读取并确认；`Peek()` + `Advance()` 可实现“先处理、后确认”的
-至少一次投递。
+**单消费者游标**（`Read` / `Peek` / `Advance`，v1 文件的唯一模式）：
+所有挂载者共享一个 `readPos`。`Peek` 不确认，重复 `Peek` 返回相同
+序列号（可识别重复）；`Peek`+`Advance` 实现“先处理、后确认”的至少
+一次投递。
+
+**消费者组**（`NewConsumer` → `Next` / `Confirm` / `Close`）：
+
+- 每个消费者注册一个槽位（上限 `MaxConsumers=16`，占满返回
+  `ErrTooManyConsumers`），并周期刷新心跳；
+- `Next` 通过一次 **CAS 推进 `claimPos`** 领取记录——每条完整记录
+  **恰好被一个消费者领取一次**，两个消费者不会把同一条记录各自当成
+  新数据处理；
+- 消费者各自推进、互不阻塞：领取只是原子操作，慢消费者只会通过回收
+  下限拖住**写者**（`ErrFull`），不会挡住其他消费者的领取；
+- 领取后必须 `Confirm` 确认；确认前再次 `Next` 返回**同一条记录**
+  （相同 `Seq`）——重复投递总能按记录本身的序列号识别；
+- 消费者崩溃或退出（含 `Close` 时仍持有记录）时，其槽位心跳过期后，
+  持有未确认的记录会被其他消费者**按相同序列号接管重投**
+  （至少一次语义，重复按 `Seq` 去重）；若死亡消费者迟迟无人接管，
+  其空间可能被写者复用，该在途记录丢失（它从未被确认）。
 
 ### 2.4 并发模型
 
-- **写者**：可多进程/多 goroutine。跨进程由 `wlock` 的 `flock(LOCK_EX)`
-  串行化，进程内由互斥锁串行化；单条记录的发布是原子单位。
-- **读者**：设计为单消费者（SPSC 风格）。多读者并发消费会竞争同一条记录，
-  不属于本通道支持范围；但多个进程同时**挂载**、以及写者与读者并发是支持的。
+- **写者**：多进程/多 goroutine，写锁 + 进程内互斥锁串行化；
+- **消费者**：多进程/多 goroutine，各自注册槽位并发领取；
+- 单条记录的发布是原子单位；消费者只能读到 `writePos` 之前、帧尾带
+  `CMIT` 且 CRC 通过的帧。
 
 ---
 
 ## 3. 崩溃恢复规则
 
-### 3.1 写者在写入中途崩溃
+### 3.1 写者在写入中途崩溃（v2：在线自愈）
 
-写者在推进 `writePos` 之前的任一时点被杀（帧字节写了一半、或整帧写完但
-尚未发布），都会留下：
+写者在推进 `writePos` 之前被杀，留下 `writePos < reservedPos` 的
+未提交分配。自愈规则：
 
-```
-readPos <= writePos < reservedPos
-                    └ 区间 = 崩溃写者残留的半条记录
-```
+1. 任意写者下次获得写锁时（`Write` 内部），或挂载时（`Open`/`Create`
+   自动 `Recover`），或显式 `Recover()` 时执行；
+2. 若写锁被存活写者持有则不动（进行中的帧可能马上合法提交）；
+3. 把残留分配改写为**空洞帧**并推进 `writePos`：那一次分配**不回收、
+   不复用**，空洞帧永久可见；其序列号已烧掉，留下可解释的序列号空洞；
+4. 已提交未确认的记录原样保留、继续占位；已确认数据不丢失、不被改写；
+5. 自愈幂等：空洞帧内容确定，重复执行结果相同，`Recover` 再次调用
+   返回 `(false, 0, nil)`。
 
-恢复规则（`Open`/`Create` 挂载时自动执行，也可显式调用 `Recover()`）：
+**未完整写入的内容绝不被消费**：消费者只认 `writePos` 与 `CMIT+CRC`。
 
-1. 先尝试**非阻塞**获取写锁；若写锁被存活写者持有，则**不回收**
-   （进行中的帧可能马上合法提交），返回 `(false, 0, nil)`；
-2. 拿到写锁后，从 `readPos` 顺序扫描到 `writePos`，核对每一帧的
-   `SHRF / CMIT / CRC`（已提交区域必须自洽，否则返回 `ErrCorrupt`）；
-3. 将 `reservedPos` 退回到 `writePos`，即**丢弃末尾残片**。残片的物理字节
-   要到容量回绕时才被覆盖，但它永远在 `writePos` 之后，读者永远不可见；
-4. 残片对应的序列号已在预留前单调分配并持久化，因此恢复后会留下一个
-   **可解释的序列号空洞**（“曾经尝试但未提交”），序列号绝不回卷重用；
-5. 恢复是**幂等**的：再次挂载/再次 `Recover()` 返回 `(false, 0, nil)`。
+v1 旧格式文件保持旧的**回退式**恢复（`reservedPos` 退回 `writePos`），
+与旧库行为逐字节一致。
 
-**未完整写入的内容绝不被消费**：读者只认 `writePos` 与 `CMIT+CRC`。
-崩溃恢复后读写位置自洽：已提交未确认的记录原样保留且继续占位，写者不能借
-回收残片覆盖它们（见 `TestCrashNoOverwriteUnread`）；已确认数据不丢失、
-不被静默改写。
+### 3.2 消费者在消费中途崩溃
 
-### 3.2 读者在读取中途崩溃
-
-读者的确认只有一个动作：推进 `readPos`。
-
-- 确认**之前**崩溃：`readPos` 未动，重新挂载后该记录被**再次投递**，
-  序列号与之前相同，消费者用 `seq` 去重（至少一次语义，见
-  `TestReaderCrashRedelivery`）；
-- 确认**之后**崩溃：`readPos` 已 `msync`，该记录占用的空间可被复用，
-  不会再次出现。
-
-### 3.3 进程异常退出时的锁
-
-`flock` 锁绑定在打开文件描述上，进程死亡（含 `SIGKILL`）时内核自动释放
-全部锁。因此下一个挂载者能立即拿到写锁完成回收，不会出现“死写者永久
-持锁”。
+- 单消费者模式：确认前崩溃 → 重新挂载后该记录按相同序列号再次投递；
+- 消费者组模式：见 2.3——在途记录被其他消费者按相同序列号接管重投；
+  `flock` 与槽位都绑定在进程生命周期上，进程死亡（含 `SIGKILL`）后
+  锁由内核释放、心跳停止，不需要任何人工清理。
 
 ---
 
@@ -182,26 +213,29 @@ go test ./... -race           # 竞态检测
 go test ./... -count=10       # 多轮稳定性
 ```
 
-测试通过**重新执行测试二进制**派生多个真实本机进程（设置
-`SHMRING_CRASH_CHILD` 环境变量区分场景），无外部依赖。关键用例：
+测试通过**重新执行测试二进制**派生多个真实本机进程（`SHMRING_CRASH_CHILD`
+环境变量区分场景），无外部依赖。关键用例：
 
 | 测试 | 场景与断言 |
 | --- | --- |
-| `TestWriteFullAndWrap` | 写满→`ErrFull`；消费后跨物理末尾回绕写入；CRC 逐帧校验；读空→`ErrEmpty`；序列号不回卷 |
-| `TestCrashNoOverwriteUnread` | 帧字节写到一半“死亡”；残片对读者不可见；回收后未消费记录仍占位、写者不得覆盖；确认后才释放 |
-| `TestWriterCrashRecovery` | 子进程在**负载写一半**与**整帧写完待发布**两种时点被杀；`Recover()` 报告的残片字节数精确可解释；重新挂载幂等 |
-| `TestReaderCrashRedelivery` | 子进程 `Peek` 后未确认即死；重新挂载同一 seq 原样重投；重复 `Peek` 可识别为重复 |
-| `TestMultiProcessStream` | 3 个真实写进程 × 60 条 + 父进程读者，180 个序列号全局唯一、无乱码、无重复投递 |
-| `TestCrossProcessMountConflicts` | 容量/魔数/版本冲突由子进程挂载触发，退出码与哨兵错误一一可区分；拒绝后在用缓冲区仍可读写 |
-| `TestMountConflicts` / `TestConcurrentRejectedMounts` | 冲突拒绝只读、不破坏在用缓冲区；并发重复挂载无死锁 |
-| `TestConcurrentSingleProcess` | 进程内 4 goroutine 并发写、唯一读者并发读，去重与内容核对 |
+| `TestMultiConsumerExactlyOnce` | 进程内 4 消费者并发领取 400 条：每条恰好一次，负载与 seq 自洽 |
+| `TestMultiConsumerCrossProcess` | 3 写进程 × 60 条 + 2 消费者子进程 + 父进程消费者：180 个 seq 与 (writer,msg) 对全局唯一 |
+| `TestConsumerRedeliversOwnHold` / `TestConsumerCloseAbandon` | 未确认重复 `Next` 返回相同 seq；持有记录退出后被接管重投 |
+| `TestConsumerCrashSteal` / `TestConsumerCrashRedeliveryProcess` | 消费者“崩溃”（协程/真实进程）后，在途记录按相同 seq 被存活消费者重投 |
+| `TestSlowConsumerBackpressure` | 慢消费者按住记录 → 写者 `ErrFull`；快消费者不受阻；确认后写者恢复且记录完好 |
+| `TestWriterCrashOnlineHeal` | 写者 A 被杀 → 已挂载写者 B 继续写、父进程消费者不重挂载读到新记录；seq=4 为可见空洞；空洞帧 @114 长度 74 可观测 |
+| `TestWriterCrashRecovery` / `TestCrashNoOverwriteUnread` | 原有崩溃恢复不回归：残片不可见、恢复幂等、未确认记录不被覆盖、空洞不回收 |
+| `TestV1LegacyBuffer` / `TestV1CrashRecoveryRewind` | v1 旧文件：老用法正常、消费者组明确拒绝、回退式恢复语义不变 |
+| `TestModeConflict` / `TestTooManyConsumers` | 两种消费模式互斥拒绝且不破坏在用方；槽位占满拒绝 |
+| `TestWriteFullAndWrap` / `TestReadEmpty` / `TestMultiProcessStream` / `TestCrossProcessMountConflicts` 等 | 上一轮用例（写满回绕、读空、参数冲突重复挂载、多写者流）全部不回归 |
 
-测试日志会打印 `reserved/write/read` 三个位置、`used/free` 空间、
-`nextSeq`，以及每条已提交帧的逻辑位置与 CRC 校验依据，例如：
+测试日志会打印 `reserved/write/read/claim/floor` 各位置、消费者槽位
+快照，以及每条已提交帧的 CRC 校验依据，例如：
 
 ```
-[after wrap writes] cap=256 reserved=336 write=336 read=112 used=224 nextSeq=7
-  verify frame@280 seq=6 len=32 crc=0xbe006197 OK
+[slow holds seq=1] reserved=992 write=992 read=0 claim=124 floor=0 slots=[{0 ... true 0 1} ...]
+writer got ErrFull: floor pinned by slow consumer's unconfirmed seq=1
+consumer (no remount) read seqs [1 2 3 5 6 7 8 9]: seq=4 is the burned hole from crashed writer A
 ```
 
 ### 4.2 命令行手动复现
@@ -209,11 +243,14 @@ go test ./... -count=10       # 多轮稳定性
 ```bash
 go build -o /tmp/shmring-demo ./cmd/shmring-demo
 D=/tmp/shmring-demo
-$D create demo 256
-$D write demo hello            # 另一个进程：写入完整记录
-$D peek  demo                  # 查看（不确认）；重复 peek 得到相同 seq
-$D read  demo                  # 读取并确认
-$D state demo                  # 查看 reserved/write/read 与 nextSeq
+$D create demo 512
+$D write demo hello-1            # 进程 A：写入
+$D write demo hello-2            # 进程 B：写入
+$D consume demo                  # 进程 C：以消费者组身份领取 seq=1
+$D consume demo                  # 进程 D：领取 seq=2（每条恰好被领一次）
+$D state   demo                  # 查看 reserved/write/read/claim 与消费者槽位
 ```
 
-连续写满后 `write` 返回 full；`read` 全部确认后再次写入会回绕复用空间。
+单消费者游标用法（`read`/`peek`）与上面消费者组用法**互斥**，同一
+缓冲区混用会被明确拒绝。连续写满后 `write` 返回 full；消费者确认后
+写者回绕复用空间。
